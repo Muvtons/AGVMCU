@@ -76,6 +76,7 @@ private:
     void rotateToDirection(char from, char to);
 };
 
-extern AGV_Navigation AGV;
+// Changed from AGV to AGVMCU
+extern AGV_Navigation AGVMCU;
 
 #endif
