@@ -54,8 +54,9 @@ private:
         char dir;
     };
 
-    const int maxSteps = 20;
-    Step steps[maxSteps];
+    static const int maxSteps = 20;  // Changed to static
+    Step steps[20];  // Fixed array size
+
     int totalSteps = 0;
     int currentStep = 0;
 
@@ -76,7 +77,6 @@ private:
     void rotateToDirection(char from, char to);
 };
 
-// Changed from AGV to AGVMCU
 extern AGV_Navigation AGVMCU;
 
 #endif
