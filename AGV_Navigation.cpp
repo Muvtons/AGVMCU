@@ -1,6 +1,5 @@
 #include "AGV_Navigation.h"
 
-// Changed from AGV to AGVMCU
 AGV_Navigation AGVMCU;
 
 void AGV_Navigation::begin() {
