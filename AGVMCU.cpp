@@ -326,12 +326,12 @@ void AGVMCU::handleSerialInput() {
                 correctDirectionUsingQRAngle(qrAngle);
 
                 switch(currentState) {
-                    case STATE_WAITING_FOR_QR:
+                    case STATE_WAITING_FOR_QR: {
                         currentState = STATE_MOVING;
                         navigateToNextStep();
                         break;
-                        
-                    case STATE_WAITING_QR_CONFIRMATION:
+                    }
+                    case STATE_WAITING_QR_CONFIRMATION: {
                         Step targetStep = path[currentStepIndex];
                         if (isAtPosition(targetStep.x, targetStep.y)) {
                             currentStepIndex++;
@@ -348,14 +348,15 @@ void AGVMCU::handleSerialInput() {
                             currentState = STATE_STOPPED;
                         }
                         break;
-                        
-                    case STATE_OBSTACLE_AVOIDANCE:
+                    }
+                    case STATE_OBSTACLE_AVOIDANCE: {
                         if (originalDestinationX != -1 && originalDestinationY != -1) {
                             publishRerouteCommand(currentX, currentY, originalDestinationX, originalDestinationY);
                         }
                         currentState = STATE_IDLE;
                         isInObstacleRecovery = false;
                         break;
+                    }
                 }
             }
             return;
