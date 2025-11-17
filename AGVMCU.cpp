@@ -1,6 +1,6 @@
 #include "AGVMCU.h"
 
-// Global instance (as you defined it)
+// Global instance
 AGVMCU agvmcu;
 
 AGVMCU::AGVMCU() 
@@ -57,45 +57,13 @@ void AGVMCU::update() {
     }
 }
 
-// NEW METHOD: Process commands from queue (replaces direct Serial reading)
-void AGVMCU::processCommand(const char* cmd) {
-    // Copy command to inputBuffer for existing logic compatibility
-    inputBuffer = String(cmd);
-    inputBuffer.trim();
-
-    Serial.print("📥 CORE0 AGVMCU RECEIVED: "); Serial.println(inputBuffer);
-
-    // ABORT, STOP, START commands
-    if (inputBuffer == "ABORT") {
-        Serial.println("📋 Command: ABORT");
-        handleAbort();
-        return;
-    }
-    if (inputBuffer == "STOP") {
-        Serial.println("📋 Command: STOP");
-        handleStop();
-        return;
-    }
-    if (inputBuffer == "START") {
-        Serial.println("📋 Command: START");
-        handleStart();
-        return;
-    }
-
-    // DISTANCE sensor
-    if (inputBuffer.startsWith("DISTANCE:")) {
-        String distanceStr = inputBuffer.substring(9);
-        float currentDistance = distanceStr.toFloat();
-        Serial.print("🔍 Distance sensor: "); Serial.print(currentDistance); 
-        Serial.println("m");
-        checkDistanceCondition(currentDistance);
-        return;
-    }
-
- // NEW METHOD: Process commands from queue (replaces direct Serial reading)
+// ============================================
+// CORRECTED: Single processCommand() function
+// ============================================
 void AGVMCU::processCommand(const char* cmd) {
     inputBuffer = String(cmd);
     inputBuffer.trim();
+
     Serial.print("📥 CORE0 AGVMCU RECEIVED: "); Serial.println(inputBuffer);
 
     // ABORT, STOP, START commands
@@ -248,6 +216,9 @@ void AGVMCU::processCommand(const char* cmd) {
     
     Serial.println("❓ Unknown command received");
 }
+// ============================================
+// END of processCommand()
+// ============================================
 
 void AGVMCU::moveForward() {
     Serial.print("⏩ MOVING FORWARD from ("); 
@@ -255,7 +226,6 @@ void AGVMCU::moveForward() {
     Serial.print(") facing "); Serial.print(currentDir);
     Serial.println(" for 2 seconds (1 grid cell)");
     
-    // Simulate motor control
     digitalWrite(IN1, HIGH);
     digitalWrite(IN2, LOW);
     digitalWrite(IN3, HIGH);
@@ -263,8 +233,7 @@ void AGVMCU::moveForward() {
     analogWrite(ENA, 255);
     analogWrite(ENB, 255);
     
-    delay(2000); // 2 seconds = 1 grid cell movement
-    
+    delay(2000);
     stopMotors();
     Serial.println("⏹️  Movement completed");
 }
@@ -275,7 +244,6 @@ void AGVMCU::moveBackward() {
     Serial.print(") facing "); Serial.print(currentDir);
     Serial.println(" for 2 seconds (1 grid cell)");
     
-    // Simulate motor control
     digitalWrite(IN1, LOW);
     digitalWrite(IN2, HIGH);
     digitalWrite(IN3, LOW);
@@ -283,14 +251,12 @@ void AGVMCU::moveBackward() {
     analogWrite(ENA, 255);
     analogWrite(ENB, 255);
     
-    delay(2000); // 2 seconds = 1 grid cell movement
-    
+    delay(2000);
     stopMotors();
     Serial.println("⏹️  Backward movement completed");
 }
 
 void AGVMCU::stopMotors() {
-    // Simulate motor stop
     digitalWrite(IN1, LOW);
     digitalWrite(IN2, LOW);
     digitalWrite(IN3, LOW);
@@ -304,7 +270,6 @@ void AGVMCU::rotateAngle(float degrees) {
     Serial.print(degrees); Serial.print("° from direction ");
     Serial.print(currentDir);
     
-    // Simulate motor control
     if (degrees > 0) {
         digitalWrite(IN1, HIGH);
         digitalWrite(IN2, LOW);
@@ -331,7 +296,7 @@ void AGVMCU::rotateAngle(float degrees) {
     
     delay(rotateTime);
     stopMotors();
-    delay(500); // 500ms pause after rotation
+    delay(500);
     
     Serial.println("✅ Rotation completed");
 }
@@ -388,11 +353,9 @@ void AGVMCU::correctDirectionUsingQRAngle(float qrAngle) {
 }
 
 void AGVMCU::navigateToNextStep() {
-    // Safety check: Ensure we don't exceed path bounds
     if (currentStepIndex >= totalSteps) {
         Serial.println("🎉 GOAL REACHED! Navigation completed.");
         currentState = STATE_GOAL_REACHED;
-        // ✅ Clear path data after completion
         totalSteps = 0;
         currentStepIndex = 0;
         return;
@@ -473,7 +436,6 @@ void AGVMCU::publishCurrentPosition() {
     Serial.print(currentX); Serial.print(","); Serial.print(currentY);
     Serial.print(") facing "); Serial.println(currentDir);
     
-    // Send to serial for external systems
     Serial.print("CURRENT_POS:");
     Serial.print(currentX); Serial.print(","); Serial.print(currentY);
     Serial.print(","); Serial.println(currentDir);
