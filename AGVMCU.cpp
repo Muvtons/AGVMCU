@@ -92,52 +92,93 @@ void AGVMCU::processCommand(const char* cmd) {
         return;
     }
 
-    // NEW PATH LOADING (COMPLETELY FIXED)
+ // NEW METHOD: Process commands from queue (replaces direct Serial reading)
+void AGVMCU::processCommand(const char* cmd) {
+    inputBuffer = String(cmd);
+    inputBuffer.trim();
+    Serial.print("📥 CORE0 AGVMCU RECEIVED: "); Serial.println(inputBuffer);
+
+    // ABORT, STOP, START commands
+    if (inputBuffer == "ABORT") {
+        Serial.println("📋 Command: ABORT");
+        handleAbort();
+        return;
+    }
+    if (inputBuffer == "STOP") {
+        Serial.println("📋 Command: STOP");
+        handleStop();
+        return;
+    }
+    if (inputBuffer == "START") {
+        Serial.println("📋 Command: START");
+        handleStart();
+        return;
+    }
+
+    // DISTANCE sensor
+    if (inputBuffer.startsWith("DISTANCE:")) {
+        String distanceStr = inputBuffer.substring(9);
+        float currentDistance = distanceStr.toFloat();
+        Serial.print("🔍 Distance sensor: "); Serial.print(currentDistance); 
+        Serial.println("m");
+        checkDistanceCondition(currentDistance);
+        return;
+    }
+
+    // === PATH LOADING (FIXED) ===
     if (inputBuffer.startsWith("(")) {
-        Serial.println("🗺️  Loading navigation path...");
+        Serial.println("🗺️  Loading NEW navigation path...");
         
-        // ✅ CRITICAL: Clear old path data completely before loading new
-        totalSteps = 0;                 // Reset step count first
-        currentStepIndex = 0;           // Reset index to start
-        isInObstacleRecovery = false;   // Exit recovery mode
+        // Reset navigation state completely
+        totalSteps = 0;
+        currentStepIndex = 0;
+        isInObstacleRecovery = false;
         
-        // Load the new path into path[] array
+        // Load the new path
         parsePath(inputBuffer);
         
         if (totalSteps > 0) {
-            // ✅ Find if current robot position exists in the NEW path
-            bool positionInPath = false;
+            // Find where the robot CURRENTLY is in the NEW path
+            int foundIndex = -1;
             for (int i = 0; i < totalSteps; i++) {
                 if (path[i].x == currentX && path[i].y == currentY) {
-                    currentStepIndex = i;  // Start from this step
-                    positionInPath = true;
-                    Serial.print("✅ Position found in new path at step ");
-                    Serial.println(i + 1);
+                    foundIndex = i;
                     break;
                 }
             }
             
-            if (!positionInPath) {
-                // Robot position isn't in new path, must start from beginning
-                Serial.println("⚠️ Current position not in path, starting from step 1");
+            if (foundIndex >= 0) {
+                // Robot is already at a step in the path
+                currentStepIndex = foundIndex;
+                Serial.print("✅ Position found in new path at step ");
+                Serial.println(currentStepIndex + 1);
+                
+                // If this is the last step, we've already arrived
+                if (currentStepIndex >= totalSteps - 1) {
+                    Serial.println("🎉 Already at final position!");
+                    currentState = STATE_GOAL_REACHED;
+                } else {
+                    // Ready to continue from this step
+                    currentState = STATE_WAITING_QR;
+                    Serial.println("✅ Ready to continue navigation from current step");
+                }
+            } else {
+                // Robot position not in path - set to first step's position
+                Serial.println("⚠️ Position not in path, resetting to start");
                 currentStepIndex = 0;
-                // Reset position to first step's starting point
                 currentX = path[0].x;
                 currentY = path[0].y;
                 currentDir = path[0].dir;
+                currentState = STATE_WAITING_QR;
+                Serial.println("📍 Reset to first step position, awaiting QR...");
             }
-            
-            // ✅ Start navigation from the correct step
-            Serial.println("✅ Starting navigation with loaded path...");
-            currentState = STATE_MOVING;
-            navigateToNextStep();
         } else {
             Serial.println("❌ Failed to load valid path");
         }
         return;
     }
 
-    // QR CODE (UNCHANGED LOGIC)
+    // QR CODE
     if (inputBuffer.startsWith("QR:")) {
         String coordData = inputBuffer.substring(3);
         int firstComma = coordData.indexOf(',');
@@ -174,7 +215,6 @@ void AGVMCU::processCommand(const char* cmd) {
                     if (isAtPosition(targetStep.x, targetStep.y)) {
                         Serial.println("✅ QR CONFIRMED - Position verified!");
                         currentStepIndex++;
-                        publishCurrentPosition();
                         
                         if (currentStepIndex >= totalSteps) {
                             Serial.println("🎉 FINAL GOAL REACHED!");
@@ -348,11 +388,11 @@ void AGVMCU::correctDirectionUsingQRAngle(float qrAngle) {
 }
 
 void AGVMCU::navigateToNextStep() {
-    // ✅ Safety check: Ensure we don't exceed new path bounds
+    // Safety check: Ensure we don't exceed path bounds
     if (currentStepIndex >= totalSteps) {
         Serial.println("🎉 GOAL REACHED! Navigation completed.");
         currentState = STATE_GOAL_REACHED;
-        // Clear path after completion to prevent stale data
+        // ✅ Clear path data after completion
         totalSteps = 0;
         currentStepIndex = 0;
         return;
@@ -373,7 +413,6 @@ void AGVMCU::navigateToNextStep() {
     Serial.println("📍 MOVING TO TARGET POSITION...");
     currentState = STATE_MOVING;
     
-    // Move forward (2 seconds)
     moveForward();
     
     // Update position based on direction
