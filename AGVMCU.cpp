@@ -1,6 +1,6 @@
 #include "AGVMCU.h"
 
-// Global instance with your preferred name
+// Global instance (as you defined it)
 AGVMCU agvmcu;
 
 AGVMCU::AGVMCU() 
@@ -41,7 +41,7 @@ void AGVMCU::begin(long baudRate) {
 
 void AGVMCU::update() {
     handleButtons();
-    handleSerialInput();
+    // REMOVED: handleSerialInput() - now called via processCommand() from queue
     
     // Additional processing based on state
     switch(currentState) {
@@ -55,6 +55,133 @@ void AGVMCU::update() {
             // Other states don't need continuous processing
             break;
     }
+}
+
+// NEW METHOD: Process commands from queue (replaces direct Serial reading)
+void AGVMCU::processCommand(const char* cmd) {
+    // Copy command to inputBuffer for existing logic compatibility
+    inputBuffer = String(cmd);
+    inputBuffer.trim();
+
+    Serial.print("📥 CORE0 AGVMCU RECEIVED: "); Serial.println(inputBuffer);
+
+    // === ALL ORIGINAL COMMAND LOGIC BELOW - UNCHANGED ===
+    
+    if (inputBuffer == "ABORT") {
+        Serial.println("📋 Command: ABORT");
+        handleAbort();
+        return;
+    }
+
+    if (inputBuffer == "STOP") {
+        Serial.println("📋 Command: STOP");
+        handleStop();
+        return;
+    }
+
+    if (inputBuffer == "START") {
+        Serial.println("📋 Command: START");
+        handleStart();
+        return;
+    }
+
+    if (inputBuffer.startsWith("DISTANCE:")) {
+        String distanceStr = inputBuffer.substring(9);
+        float currentDistance = distanceStr.toFloat();
+        Serial.print("🔍 Distance sensor: "); Serial.print(currentDistance); 
+        Serial.println("m");
+        checkDistanceCondition(currentDistance);
+        return;
+    }
+
+    if (inputBuffer.startsWith("(")) {
+        Serial.println("🗺️  Loading navigation path...");
+        parsePath(inputBuffer);
+        if (totalSteps > 0) {
+            currentStepIndex = 0;
+            isInObstacleRecovery = false;
+
+            if (currentX == -1 || currentY == -1) {
+                currentState = STATE_WAITING_FOR_QR;
+                Serial.println("📍 Awaiting initial QR position...");
+            } else {
+                Serial.println("✅ Starting navigation with known position...");
+                currentState = STATE_MOVING;
+                navigateToNextStep();
+            }
+        }
+        return;
+    }
+
+    if (inputBuffer.startsWith("QR:")) {
+        String coordData = inputBuffer.substring(3);
+        int firstComma = coordData.indexOf(',');
+        int secondComma = coordData.indexOf(',', firstComma + 1);
+        
+        if (secondComma != -1) {
+            int qrX = coordData.substring(0, firstComma).toInt();
+            int qrY = coordData.substring(firstComma + 1, secondComma).toInt();
+            float qrAngle = coordData.substring(secondComma + 1).toFloat();
+
+            Serial.print("📷 QR DETECTED: Position ("); 
+            Serial.print(qrX); Serial.print(","); Serial.print(qrY);
+            Serial.print("), Angle: "); Serial.print(qrAngle); Serial.println("°");
+
+            currentX = qrX;
+            currentY = qrY;
+
+            correctDirectionUsingQRAngle(qrAngle);
+
+            switch(currentState) {
+                case STATE_WAITING_FOR_QR: {
+                    Serial.println("✅ Initial QR received - Starting navigation!");
+                    currentState = STATE_MOVING;
+                    navigateToNextStep();
+                    break;
+                }
+                case STATE_WAITING_QR_CONFIRMATION: {
+                    Step targetStep = path[currentStepIndex];
+                    Serial.print("🔍 Verifying position: Expected (");
+                    Serial.print(targetStep.x); Serial.print(","); Serial.print(targetStep.y);
+                    Serial.print("), Got ("); Serial.print(currentX); Serial.print(",");
+                    Serial.print(currentY); Serial.println(")");
+                    
+                    if (isAtPosition(targetStep.x, targetStep.y)) {
+                        Serial.println("✅ QR CONFIRMED - Position verified!");
+                        currentStepIndex++;
+                        publishCurrentPosition();
+                        
+                        if (currentStepIndex >= totalSteps) {
+                            Serial.println("🎉 FINAL GOAL REACHED!");
+                            currentState = STATE_GOAL_REACHED;
+                        } else {
+                            Serial.println("✅ Moving to next step...");
+                            currentState = STATE_MOVING;
+                            navigateToNextStep();
+                        }
+                    } else {
+                        Serial.println("❌ QR MISMATCH - Navigation failed!");
+                        Serial.println("⚠️  Please verify robot position and restart");
+                        currentState = STATE_STOPPED;
+                    }
+                    break;
+                }
+                case STATE_OBSTACLE_AVOIDANCE: {
+                    Serial.println("✅ QR found during obstacle recovery!");
+                    if (originalDestinationX != -1 && originalDestinationY != -1) {
+                        publishRerouteCommand(currentX, currentY, originalDestinationX, originalDestinationY);
+                    }
+                    currentState = STATE_IDLE;
+                    isInObstacleRecovery = false;
+                    Serial.println("🔄 Obstacle recovery complete - Awaiting new path");
+                    break;
+                }
+            }
+        }
+        return;
+    }
+    
+    Serial.println("❓ Unknown command received");
 }
 
 void AGVMCU::moveForward() {
@@ -362,131 +489,6 @@ void AGVMCU::handleButtons() {
             Serial.println("🛑 Button: ABORT PRESSED");
             handleAbort();
         }
-    }
-}
-
-void AGVMCU::handleSerialInput() {
-    if (Serial.available()) {
-        inputBuffer = Serial.readStringUntil('\n');
-        inputBuffer.trim();
-
-        Serial.print("📥 RECEIVED: "); Serial.println(inputBuffer);
-
-        if (inputBuffer == "ABORT") {
-            Serial.println("📋 Command: ABORT");
-            handleAbort();
-            return;
-        }
-
-        if (inputBuffer == "STOP") {
-            Serial.println("📋 Command: STOP");
-            handleStop();
-            return;
-        }
-
-        if (inputBuffer == "START") {
-            Serial.println("📋 Command: START");
-            handleStart();
-            return;
-        }
-
-        if (inputBuffer.startsWith("DISTANCE:")) {
-            String distanceStr = inputBuffer.substring(9);
-            float currentDistance = distanceStr.toFloat();
-            Serial.print("🔍 Distance sensor: "); Serial.print(currentDistance); 
-            Serial.println("m");
-            checkDistanceCondition(currentDistance);
-            return;
-        }
-
-        if (inputBuffer.startsWith("(")) {
-            Serial.println("🗺️  Loading navigation path...");
-            parsePath(inputBuffer);
-            if (totalSteps > 0) {
-                currentStepIndex = 0;
-                isInObstacleRecovery = false;
-
-                if (currentX == -1 || currentY == -1) {
-                    currentState = STATE_WAITING_FOR_QR;
-                    Serial.println("📍 Awaiting initial QR position...");
-                } else {
-                    Serial.println("✅ Starting navigation with known position...");
-                    currentState = STATE_MOVING;
-                    navigateToNextStep();
-                }
-            }
-            return;
-        }
-
-        if (inputBuffer.startsWith("QR:")) {
-            String coordData = inputBuffer.substring(3);
-            int firstComma = coordData.indexOf(',');
-            int secondComma = coordData.indexOf(',', firstComma + 1);
-            
-            if (secondComma != -1) {
-                int qrX = coordData.substring(0, firstComma).toInt();
-                int qrY = coordData.substring(firstComma + 1, secondComma).toInt();
-                float qrAngle = coordData.substring(secondComma + 1).toFloat();
-
-                Serial.print("📷 QR DETECTED: Position ("); 
-                Serial.print(qrX); Serial.print(","); Serial.print(qrY);
-                Serial.print("), Angle: "); Serial.print(qrAngle); Serial.println("°");
-
-                currentX = qrX;
-                currentY = qrY;
-
-                correctDirectionUsingQRAngle(qrAngle);
-
-                switch(currentState) {
-                    case STATE_WAITING_FOR_QR: {
-                        Serial.println("✅ Initial QR received - Starting navigation!");
-                        currentState = STATE_MOVING;
-                        navigateToNextStep();
-                        break;
-                    }
-                    case STATE_WAITING_QR_CONFIRMATION: {
-                        Step targetStep = path[currentStepIndex];
-                        Serial.print("🔍 Verifying position: Expected (");
-                        Serial.print(targetStep.x); Serial.print(","); Serial.print(targetStep.y);
-                        Serial.print("), Got ("); Serial.print(currentX); Serial.print(",");
-                        Serial.print(currentY); Serial.println(")");
-                        
-                        if (isAtPosition(targetStep.x, targetStep.y)) {
-                            Serial.println("✅ QR CONFIRMED - Position verified!");
-                            currentStepIndex++;
-                            publishCurrentPosition();
-                            
-                            if (currentStepIndex >= totalSteps) {
-                                Serial.println("🎉 FINAL GOAL REACHED!");
-                                currentState = STATE_GOAL_REACHED;
-                            } else {
-                                Serial.println("✅ Moving to next step...");
-                                currentState = STATE_MOVING;
-                                navigateToNextStep();
-                            }
-                        } else {
-                            Serial.println("❌ QR MISMATCH - Navigation failed!");
-                            Serial.println("⚠️  Please verify robot position and restart");
-                            currentState = STATE_STOPPED;
-                        }
-                        break;
-                    }
-                    case STATE_OBSTACLE_AVOIDANCE: {
-                        Serial.println("✅ QR found during obstacle recovery!");
-                        if (originalDestinationX != -1 && originalDestinationY != -1) {
-                            publishRerouteCommand(currentX, currentY, originalDestinationX, originalDestinationY);
-                        }
-                        currentState = STATE_IDLE;
-                        isInObstacleRecovery = false;
-                        Serial.println("🔄 Obstacle recovery complete - Awaiting new path");
-                        break;
-                    }
-                }
-            }
-            return;
-        }
-        
-        Serial.println("❓ Unknown command received");
     }
 }
 
