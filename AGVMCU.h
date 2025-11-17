@@ -96,6 +96,7 @@ public:
     AGVMCU();
     void begin(long baudRate = 115200);
     void update();
+    void processCommand(const char* command);  // ✅ ADD THIS EXACT LINE
 };
 
 // Global instance with your preferred name
