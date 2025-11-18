@@ -3,126 +3,149 @@
 
 #include <Arduino.h>
 
-// Motor pins
-#define ENA 16
-#define IN1 17
-#define IN2 18
-#define ENB 19
-#define IN3 20
-#define IN4 21
+// Motor pins (L298N driver)
+#define ENA 16    // Motor A PWM
+#define IN1 17    // Motor A direction 1
+#define IN2 18    // Motor A direction 2
+#define ENB 19    // Motor B PWM
+#define IN3 20    // Motor B direction 1
+#define IN4 21    // Motor B direction 2
 
-// Button pins
+// Button pins (active LOW with pull-ups)
 #define START_BUTTON_PIN 4
 #define STOP_BUTTON_PIN 5
 #define ABORT_BUTTON_PIN 6
 
 // Navigation constants
-#define maxSteps 50
+#define maxSteps 50      // Maximum waypoints in path
 
-// System states
+// ============================================================================
+// STATE MACHINE - UPDATED FOR QR-VERIFIED NAVIGATION
+// ============================================================================
 enum AGVState {
-    STATE_IDLE,
-    STATE_WAITING_FOR_QR,
-    STATE_MOVING,
-    STATE_WAITING_QR_CONFIRMATION,
-    STATE_STOPPED,
-    STATE_ABORTED,
-    STATE_GOAL_REACHED,
-    STATE_OBSTACLE_AVOIDANCE
+    STATE_IDLE,                 // No path loaded, system idle
+    STATE_WAITING_QR,          // At waypoint, QR verification required
+    STATE_ADJUSTING_ORIENTATION, // Rotating to correct direction
+    STATE_MOVING,              // Moving to next waypoint
+    STATE_STOPPED,             // Paused by STOP command
+    STATE_BLOCKED,             // Obstacle detected, waiting for new path
+    STATE_QR_MISMATCH,         // QR code didn't match path (critical error)
+    STATE_GOAL_REACHED         // Successfully completed path
 };
 
-// Path step structure
+// ============================================================================
+// PATH STEP STRUCTURE - NOW INCLUDES DISTANCE
+// ============================================================================
 struct Step {
-    int x;
-    int y;
-    char dir; // 'N', 'S', 'E', 'W'
+    int x;           // Grid X coordinate
+    int y;           // Grid Y coordinate
+    char dir;        // Direction: 'N', 'S', 'E', 'W'
+    int distanceCm;  // Distance to travel in centimeters
 };
 
 class AGVMCU {
 public:
     AGVMCU();
     
-    // ✅ UPDATED: Added initSerial parameter
     void begin(long baudRate = 115200, bool initSerial = true);
     void update();
     void processCommand(const char* cmd);
 
 private:
-    // Navigation state
-    Step path[maxSteps];
-    int totalSteps;
-    int currentStepIndex;
-    int currentX;
-    int currentY;
-    char currentDir;
-    AGVState currentState;
+    // =========================================================================
+    // NAVIGATION STATE CORE
+    // =========================================================================
+    Step path[maxSteps];        // Loaded navigation path
+    int totalSteps;             // Total waypoints in path
+    int currentStepIndex;       // Last verified step index
+    int targetStepIndex;        // Next step to move to
+    int lastQRCodeStep;         // Most recent QR-confirmed step
     
-    // Obstacle recovery
-    int lastSafeX;
-    int lastSafeY;
-    char lastSafeDir;
-    int blockedTargetX;
-    int blockedTargetY;
-    int originalDestinationX;
-    int originalDestinationY;
-    bool isInObstacleRecovery;
+    // Current and expected positions
+    int currentX, currentY;     // Ground truth from QR
+    int expectedX, expectedY;   // Expected from path
+    char currentDir;            // Current facing direction
+    char expectedDir;           // Expected direction from path
+    AGVState currentState;      // Main state machine state
     
-    // Distance sensor
-    float distanceThreshold;
-    unsigned long distanceTimeoutMs;
-    bool distanceBelowThreshold;
-    unsigned long distanceBelowThresholdStart;
+    // =========================================================================
+    // OBSTACLE HANDLING
+    // =========================================================================
+    int blockedStepIndex;       // Where obstacle was encountered
+    float distanceThreshold;    // Obstacle detection threshold (meters)
     
-    // Button debouncing
+    // =========================================================================
+    // BUTTON DEBOUNCING
+    // =========================================================================
     unsigned long lastAbortPress;
     unsigned long lastStartPress;
     unsigned long lastStopPress;
     
-    // Non-blocking movement
+    // =========================================================================
+    // NON-BLOCKING MOVEMENT TIMING
+    // =========================================================================
     unsigned long moveStartTime;
     bool isMoving;
+    unsigned long moveDurationMs;   // Calculated from distance
+    
     unsigned long rotateStartTime;
     bool isRotating;
     unsigned long targetRotationTime;
-    unsigned long qrWaitStartTime;
     
-    // Command buffer
-    String inputBuffer;
+    // =========================================================================
+    // PRIMARY COMMAND PROCESSORS
+    // =========================================================================
+    void processQRCode(String qrData);
+    void handleQRMatch(int stepIndex, float qrAngle);
+    void handleQRMismatch();
+    void loadPath(String rawPath);
+    void clearPath();
     
-    // Navigation functions
-    void navigateToNextStep();
+    // =========================================================================
+    // CONTROL COMMAND HANDLERS
+    // =========================================================================
+    void handleStart();
+    void handleStop();
+    void handleAbort();
+    void handleButtons();
+    void handleObstacleDetection(float distance);
+    
+    // =========================================================================
+    // NAVIGATION EXECUTION
+    // =========================================================================
+    void navigateToStep(int stepIndex);
+    void startMoveToNextWaypoint();
+    void startRotateToDirection(char targetDir);
+    
+    // =========================================================================
+    // PATH PARSING AND VALIDATION
+    // =========================================================================
     void parsePath(String raw);
-    bool isAtPosition(int x, int y);
-    void updatePositionAfterMove();
-    void updateMovementStateMachine();
-    int findCurrentStepIndex();
+    int findStepIndex(int x, int y);
     char calculateDirectionToTarget(int fromX, int fromY, int toX, int toY);
     
-    // Motor control
-    void startMoveForward();
-    void startMoveBackward();
-    void moveBackward(); // Blocking version for recovery
+    // =========================================================================
+    // MOTOR CONTROL
+    // =========================================================================
     void stopMotors();
-    void rotateAngle(float degrees);
-    void rotateToDirection(char from, char to);
+    void rotateAngle(float degrees);  // Blocking (emergency use only)
+    
+    // =========================================================================
+    // UTILITY CALCULATIONS
+    // =========================================================================
+    int calculateAngleDifference(char from, char to);
+    unsigned long calculateRotationTime(float degrees);
+    unsigned long calculateMoveDuration(float distanceCm);
     void correctDirectionUsingQRAngle(float qrAngle);
+    const char* getStateName();
     
-    // Command handlers
-    void handleAbort();
-    void handleStop();
-    void handleStart();
-    void handleButtons();
-    
-    // Distance sensor
-    void checkDistanceCondition(float currentDistance);
-    void handleObstacleTimeout();
-    void startObstacleRecovery();
-    
-    // Communication
+    // =========================================================================
+    // STATUS PUBLISHING
+    // =========================================================================
     void publishCurrentPosition();
-    void publishRerouteCommand(int src_x, int src_y, int dst_x, int dst_y);
 };
 
+// Global instance
 extern AGVMCU agvmcu;
 
 #endif // AGVMCU_H
