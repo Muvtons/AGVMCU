@@ -95,6 +95,8 @@ private:
     bool isAtPosition(int x, int y);
     void updatePositionAfterMove();
     void updateMovementStateMachine();
+    int findCurrentStepIndex();
+    char calculateDirectionToTarget(int fromX, int fromY, int toX, int toY);
     
     // Motor control
     void startMoveForward();
