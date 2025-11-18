@@ -58,14 +58,16 @@ void AGVMCU::updateMovementStateMachine() {
         
         Serial.println("⏹️ Movement completed");
         
-        // Transition to waiting for QR confirmation
-        if (currentState == STATE_MOVING) {
-            Serial.print("📍 Movement complete. Awaiting QR verification at (");
-            Serial.print(path[currentStepIndex].x); Serial.print(","); 
-            Serial.print(path[currentStepIndex].y); Serial.println(")");
-            
-            currentState = STATE_WAITING_QR_CONFIRMATION;
-            qrWaitStartTime = currentTime;
+        // Check if we reached destination
+        if (currentStepIndex >= totalSteps - 1) {
+            Serial.println("🎉🎉🎉 DESTINATION REACHED! 🎉🎉🎉");
+            currentState = STATE_GOAL_REACHED;
+            publishCurrentPosition();
+        } else {
+            // Continue to next waypoint
+            currentStepIndex++;
+            Serial.println("🎯 Moving to next waypoint...");
+            navigateToNextStep();
         }
     }
     
@@ -73,36 +75,8 @@ void AGVMCU::updateMovementStateMachine() {
     if (isRotating && currentTime - rotateStartTime >= targetRotationTime) {
         stopMotors();
         isRotating = false;
-        delay(500); // Small stabilization delay after rotation
+        delay(500);
         Serial.println("✅ Rotation completed");
-    }
-    
-    // Handle QR wait timeout
-    if (currentState == STATE_WAITING_QR_CONFIRMATION && 
-        currentTime - qrWaitStartTime >= 10000) { // 10 second timeout
-        
-        Serial.println("⚠️ QR scan timeout - Using dead reckoning position");
-        Step targetStep = path[currentStepIndex];
-        
-        // Trust our dead reckoning
-        if (isAtPosition(targetStep.x, targetStep.y)) {
-            Serial.println("✅ Position confirmed by dead reckoning");
-            currentStepIndex++;
-            
-            if (currentStepIndex >= totalSteps) {
-                Serial.println("🎉 FINAL GOAL REACHED!");
-                currentState = STATE_GOAL_REACHED;
-                publishCurrentPosition();
-            } else {
-                Serial.println("🎯 Proceeding to next step...");
-                currentState = STATE_MOVING;
-                navigateToNextStep();
-            }
-        } else {
-            Serial.println("❌ Position mismatch - Stopping for safety");
-            currentState = STATE_STOPPED;
-            stopMotors();
-        }
     }
 }
 
@@ -111,6 +85,7 @@ void AGVMCU::updatePositionAfterMove() {
     Serial.print(currentX); Serial.print(","); Serial.print(currentY);
     Serial.print(") facing "); Serial.print(currentDir);
     
+    // Move in current direction
     switch(currentDir) {
         case 'E': currentX++; break;
         case 'W': currentX--; break;
@@ -159,37 +134,52 @@ void AGVMCU::processCommand(const char* cmd) {
     if (inputBuffer.startsWith("(")) {
         Serial.println("🗺️  Loading NEW navigation path...");
         
-        // Reset all navigation state
-        totalSteps = 0;
-        currentStepIndex = 0;
-        isInObstacleRecovery = false;
-        
-        // Load the path
+        // Parse the path
         parsePath(inputBuffer);
         
-        if (totalSteps > 0) {
-            Serial.println("✅ Path loaded successfully.");
-            Serial.print("📍 Required START position: (");
-            Serial.print(path[0].x); Serial.print(","); Serial.print(path[0].y);
-            Serial.print(") facing "); Serial.println(path[0].dir);
+        if (totalSteps < 2) {
+            Serial.println("❌ Invalid path: Need at least source and destination");
+            return;
+        }
+        
+        Serial.println("✅ Path loaded successfully.");
+        Serial.print("📍 SOURCE: (");
+        Serial.print(path[0].x); Serial.print(","); Serial.print(path[0].y);
+        Serial.print(") facing "); Serial.println(path[0].dir);
+        
+        Serial.print("🎯 DESTINATION: (");
+        Serial.print(path[totalSteps-1].x); Serial.print(","); Serial.print(path[totalSteps-1].y);
+        Serial.print(") facing "); Serial.println(path[totalSteps-1].dir);
+        
+        // Check if we already know our position
+        if (currentX != -1 && currentY != -1) {
+            Serial.print("📍 Current known position: (");
+            Serial.print(currentX); Serial.print(","); Serial.print(currentY);
+            Serial.print(") facing "); Serial.println(currentDir);
             
-            if (currentX == -1 || currentY == -1) {
-                Serial.println("⚠️  Current position unknown. Please scan QR at start position.");
+            // Find which step we're at
+            currentStepIndex = findCurrentStepIndex();
+            
+            if (currentStepIndex == -1) {
+                Serial.println("⚠️ Current position not in path! Scan QR at path position.");
+                currentState = STATE_IDLE;
+            } else if (currentStepIndex >= totalSteps - 1) {
+                Serial.println("✅ Already at destination!");
+                currentState = STATE_GOAL_REACHED;
             } else {
-                Serial.print("📍 Current position: (");
-                Serial.print(currentX); Serial.print(","); Serial.print(currentY);
-                Serial.print(")"); Serial.println(currentDir);
-                if (currentX == path[0].x && currentY == path[0].y) {
-                    Serial.println("✅ Robot is already at start position.");
-                } else {
-                    Serial.println("⚠️  Robot is NOT at start position. Move to start and scan QR.");
-                }
+                Serial.print("✅ Found position: Step ");
+                Serial.print(currentStepIndex + 1);
+                Serial.print(" of "); Serial.println(totalSteps);
+                Serial.println("🚀 Ready to navigate! Send START or will auto-start...");
+                
+                // Auto-start navigation
+                currentState = STATE_MOVING;
+                currentStepIndex++; // Move to NEXT waypoint
+                navigateToNextStep();
             }
-            
-            // Wait for QR verification of start position
-            currentState = STATE_WAITING_FOR_QR;
         } else {
-            Serial.println("❌ Failed to load valid path");
+            Serial.println("📍 Position unknown - Waiting for QR scan...");
+            currentState = STATE_IDLE;
         }
         return;
     }
@@ -213,127 +203,117 @@ void AGVMCU::processCommand(const char* cmd) {
         Serial.print(qrX); Serial.print(","); Serial.print(qrY);
         Serial.print("), Angle: "); Serial.print(qrAngle); Serial.println("°");
 
-        // Update current position from QR (this is ground truth)
+        // Update current position from QR (ground truth)
         currentX = qrX;
         currentY = qrY;
         correctDirectionUsingQRAngle(qrAngle);
 
-        // Handle QR based on current state
-        switch(currentState) {
-            case STATE_WAITING_FOR_QR: {
-                // This is the INITIAL scan to verify start position
-                if (totalSteps == 0) {
-                    Serial.println("❌ No path loaded yet. Path must be loaded before navigation.");
-                    return;
-                }
-                
-                Serial.print("🔍 Verifying START position: Expected (");
-                Serial.print(path[0].x); Serial.print(","); Serial.print(path[0].y);
-                Serial.print("), Got ("); Serial.print(currentX); Serial.print(",");
-                Serial.print(currentY); Serial.println(")");
-                
-                if (isAtPosition(path[0].x, path[0].y)) {
-                    Serial.println("✅ START position verified!");
-                    currentStepIndex = 1; // Ready to move to first real step
-                    
-                    currentState = STATE_MOVING;
-                    Serial.println("🚀 Starting navigation...");
-                    navigateToNextStep();
-                } else {
-                    Serial.println("❌ NOT at start position! Move robot to (");
-                    Serial.print(path[0].x); Serial.print(","); Serial.print(path[0].y); Serial.println(")");
-                    // Stay in STATE_WAITING_FOR_QR
-                }
-                break;
-            }
-            
-            case STATE_WAITING_QR_CONFIRMATION: {
-                // This scan verifies we reached our target step
-                if (currentStepIndex >= totalSteps) {
-                    Serial.println("❌ Navigation error: Step index out of bounds");
-                    currentState = STATE_STOPPED;
-                    return;
-                }
-                
-                Step targetStep = path[currentStepIndex];
-                
-                Serial.print("🔍 Verifying step "); Serial.print(currentStepIndex + 1);
-                Serial.print(": Expected ("); Serial.print(targetStep.x); Serial.print(",");
-                Serial.print(targetStep.y); Serial.print("), Got ("); Serial.print(currentX);
-                Serial.print(","); Serial.print(currentY); Serial.println(")");
-                
-                if (isAtPosition(targetStep.x, targetStep.y)) {
-                    Serial.println("✅ Step verified by QR!");
-                    
-                    // Move to next step
-                    currentStepIndex++;
-                    
-                    if (currentStepIndex >= totalSteps) {
-                        Serial.println("🎉 FINAL GOAL REACHED!");
-                        currentState = STATE_GOAL_REACHED;
-                        publishCurrentPosition();
-                    } else {
-                        Serial.println("🎯 Proceeding to next step...");
-                        currentState = STATE_MOVING;
-                        navigateToNextStep();
-                    }
-                } else {
-                    Serial.println("❌ QR MISMATCH!");
-                    Serial.println("⚠️  Navigation failed - System stopped");
-                    currentState = STATE_STOPPED;
-                    stopMotors();
-                }
-                break;
-            }
-            
-            case STATE_OBSTACLE_AVOIDANCE: {
-                Serial.println("✅ QR found during obstacle recovery!");
-                if (originalDestinationX != -1 && originalDestinationY != -1) {
-                    publishRerouteCommand(currentX, currentY, originalDestinationX, originalDestinationY);
-                }
-                currentState = STATE_IDLE;
-                isInObstacleRecovery = false;
-                Serial.println("🔄 Recovery complete - Awaiting new path");
-                break;
-            }
-            
-            default: {
-                // QR scanned in unexpected state - just update position
-                Serial.println("ℹ️  Position updated from QR");
-                publishCurrentPosition();
-                break;
-            }
+        // Handle QR based on navigation state
+        if (totalSteps == 0) {
+            Serial.println("ℹ️ Position updated. Load path to start navigation.");
+            publishCurrentPosition();
+            return;
         }
+        
+        // Find if this QR matches any waypoint in path
+        currentStepIndex = findCurrentStepIndex();
+        
+        if (currentStepIndex == -1) {
+            Serial.println("❌ QR POSITION NOT IN PATH!");
+            Serial.println("🔄 Turning around 180° and stopping...");
+            rotateAngle(180);
+            switch(currentDir) {
+                case 'E': currentDir = 'W'; break;
+                case 'W': currentDir = 'E'; break;
+                case 'N': currentDir = 'S'; break;
+                case 'S': currentDir = 'N'; break;
+            }
+            currentState = STATE_STOPPED;
+            Serial.println("⏹️ System STOPPED - Scan correct QR or reload path");
+            return;
+        }
+        
+        Serial.print("✅ QR matched! At step ");
+        Serial.print(currentStepIndex + 1);
+        Serial.print(" of "); Serial.println(totalSteps);
+        
+        // Check if at destination
+        if (currentStepIndex >= totalSteps - 1) {
+            Serial.println("🎉🎉🎉 DESTINATION REACHED! 🎉🎉🎉");
+            currentState = STATE_GOAL_REACHED;
+            publishCurrentPosition();
+            return;
+        }
+        
+        // Move to next waypoint
+        if (currentState != STATE_MOVING) {
+            Serial.println("🚀 Starting navigation to next waypoint...");
+            currentState = STATE_MOVING;
+            currentStepIndex++; // Move to NEXT waypoint
+            navigateToNextStep();
+        } else {
+            Serial.println("✅ Position confirmed, continuing...");
+        }
+        
         return;
     }
     
     Serial.println("❓ Unknown command");
 }
 
+int AGVMCU::findCurrentStepIndex() {
+    for (int i = 0; i < totalSteps; i++) {
+        if (path[i].x == currentX && path[i].y == currentY) {
+            return i;
+        }
+    }
+    return -1; // Not found
+}
+
 void AGVMCU::navigateToNextStep() {
     if (currentStepIndex >= totalSteps) {
-        Serial.println("🎉 GOAL REACHED!");
+        Serial.println("🎉 DESTINATION REACHED!");
         currentState = STATE_GOAL_REACHED;
         return;
     }
 
     Step targetStep = path[currentStepIndex];
     
-    Serial.print("🎯 MOVING to step "); Serial.print(currentStepIndex + 1);
+    Serial.print("🎯 NAVIGATING to step "); Serial.print(currentStepIndex + 1);
     Serial.print(" of "); Serial.print(totalSteps);
     Serial.print(": ("); Serial.print(targetStep.x); Serial.print(",");
     Serial.print(targetStep.y); Serial.print(") facing "); Serial.println(targetStep.dir);
 
-    // Check and adjust direction
-    if (currentDir != targetStep.dir) {
+    // Calculate direction needed to reach target
+    char neededDir = calculateDirectionToTarget(currentX, currentY, targetStep.x, targetStep.y);
+    
+    Serial.print("📍 Current: ("); Serial.print(currentX); Serial.print(",");
+    Serial.print(currentY); Serial.print(") facing "); Serial.println(currentDir);
+    Serial.print("🧭 Need to face: "); Serial.println(neededDir);
+
+    // Adjust direction if needed
+    if (currentDir != neededDir) {
         Serial.println("🔄 Adjusting direction...");
-        rotateToDirection(currentDir, targetStep.dir);
+        rotateToDirection(currentDir, neededDir);
     }
 
     // Execute non-blocking movement
     Serial.println("⏩ Starting forward movement...");
     currentState = STATE_MOVING;
     startMoveForward();
+}
+
+char AGVMCU::calculateDirectionToTarget(int fromX, int fromY, int toX, int toY) {
+    int dx = toX - fromX;
+    int dy = toY - fromY;
+    
+    // Prioritize X movement, then Y
+    if (dx > 0) return 'E';
+    if (dx < 0) return 'W';
+    if (dy > 0) return 'N';
+    if (dy < 0) return 'S';
+    
+    return currentDir; // Already at target
 }
 
 // Non-blocking motor control functions
@@ -354,25 +334,7 @@ void AGVMCU::startMoveForward() {
     isMoving = true;
 }
 
-void AGVMCU::startMoveBackward() {
-    Serial.print("⏪ MOVING BACKWARD from ("); 
-    Serial.print(currentX); Serial.print(","); Serial.print(currentY);
-    Serial.print(") facing "); Serial.print(currentDir);
-    Serial.println(" for 2 seconds (1 grid cell)");
-    
-    digitalWrite(IN1, LOW);
-    digitalWrite(IN2, HIGH);
-    digitalWrite(IN3, LOW);
-    digitalWrite(IN4, HIGH);
-    analogWrite(ENA, 255);
-    analogWrite(ENB, 255);
-    
-    moveStartTime = millis();
-    isMoving = true;
-}
-
 void AGVMCU::moveBackward() {
-    // Blocking version for obstacle recovery
     Serial.print("⏪ MOVING BACKWARD from ("); 
     Serial.print(currentX); Serial.print(","); Serial.print(currentY);
     Serial.print(") facing "); Serial.print(currentDir);
@@ -409,7 +371,6 @@ void AGVMCU::stopMotors() {
     analogWrite(ENA, 0);
     analogWrite(ENB, 0);
     
-    // Clear movement flags
     isMoving = false;
     isRotating = false;
 }
@@ -443,7 +404,7 @@ void AGVMCU::rotateAngle(float degrees) {
     
     Serial.print(" for "); Serial.print(rotateTime); Serial.println("ms");
     
-    delay(rotateTime); // Keep blocking for rotation (quick operation)
+    delay(rotateTime);
     stopMotors();
     delay(500);
     
@@ -568,22 +529,12 @@ void AGVMCU::handleAbort() {
     currentState = STATE_ABORTED;
     isInObstacleRecovery = false;
     publishCurrentPosition();
-    totalSteps = 0;
-    currentStepIndex = 0;
     Serial.println("⏹️  System in ABORTED state");
 }
 
 void AGVMCU::handleStop() {
     Serial.println("⏸️  STOP COMMAND - PAUSING NAVIGATION");
     stopMotors();
-    
-    // If we were moving, update state appropriately
-    if (currentState == STATE_MOVING) {
-        if (isMoving) {
-            Serial.println("⚠️  Stopped during movement - position may be uncertain");
-        }
-    }
-    
     currentState = STATE_STOPPED;
     Serial.println("⏹️  System in STOPPED state");
 }
@@ -592,9 +543,8 @@ void AGVMCU::handleStart() {
     Serial.println("▶️  START COMMAND RECEIVED");
     if (currentState == STATE_STOPPED || currentState == STATE_ABORTED) {
         if (totalSteps > 0 && currentX != -1 && currentY != -1) {
-            // Determine where to resume
-            if (currentStepIndex >= totalSteps) {
-                Serial.println("❌ Navigation already completed");
+            if (currentStepIndex >= totalSteps - 1) {
+                Serial.println("✅ Already at destination");
                 return;
             }
             
@@ -603,7 +553,6 @@ void AGVMCU::handleStart() {
             navigateToNextStep();
         } else {
             Serial.println("❌ Cannot start: No path loaded or position unknown");
-            Serial.println("ℹ️  Load path first, scan QR at start position");
         }
     } else {
         Serial.println("⚠️  Already running or invalid state for START");
@@ -641,9 +590,6 @@ void AGVMCU::handleButtons() {
 void AGVMCU::checkDistanceCondition(float currentDistance) {
     unsigned long currentTime = millis();
     
-    Serial.print("🔍 Distance check: "); Serial.print(currentDistance); 
-    Serial.print("m (threshold: "); Serial.print(distanceThreshold); Serial.println("m)");
-    
     if (currentDistance < distanceThreshold) {
         if (!distanceBelowThreshold) {
             distanceBelowThreshold = true;
@@ -678,26 +624,11 @@ void AGVMCU::handleObstacleTimeout() {
         lastSafeX = currentX;
         lastSafeY = currentY;
         lastSafeDir = currentDir;
-        Serial.print("📍 Safe position stored: (");
-        Serial.print(lastSafeX); Serial.print(","); Serial.print(lastSafeY);
-        Serial.print(") facing "); Serial.println(lastSafeDir);
     }
     
-    if (currentStepIndex < totalSteps) {
-        blockedTargetX = path[currentStepIndex].x;
-        blockedTargetY = path[currentStepIndex].y;
-        
-        if (totalSteps > 0) {
-            originalDestinationX = path[totalSteps - 1].x;
-            originalDestinationY = path[totalSteps - 1].y;
-        }
-        
-        Serial.print("🎯 Blocked target: ("); 
-        Serial.print(blockedTargetX); Serial.print(","); Serial.print(blockedTargetY); 
-        Serial.println(")");
-        Serial.print("🏁 Original destination: ("); 
-        Serial.print(originalDestinationX); Serial.print(","); Serial.print(originalDestinationY); 
-        Serial.println(")");
+    if (totalSteps > 0) {
+        originalDestinationX = path[totalSteps - 1].x;
+        originalDestinationY = path[totalSteps - 1].y;
     }
     
     startObstacleRecovery();
@@ -712,11 +643,8 @@ void AGVMCU::startObstacleRecovery() {
     currentState = STATE_OBSTACLE_AVOIDANCE;
     isInObstacleRecovery = true;
     
-    // Turn 180 degrees
-    Serial.println("🔄 Turning 180° away from obstacle...");
     rotateAngle(180);
     
-    // Update direction for backward movement
     switch(currentDir) {
         case 'E': currentDir = 'W'; break;
         case 'W': currentDir = 'E'; break;
@@ -726,16 +654,13 @@ void AGVMCU::startObstacleRecovery() {
     
     Serial.print("🔄 Now facing: "); Serial.println(currentDir);
     
-    // Move back one cell to safe position (blocking OK for recovery)
-    Serial.println("⏪ Moving backward to safe position...");
     moveBackward();
     
-    // Request reroute from ROS2
     if (currentX != -1 && currentY != -1 && originalDestinationX != -1 && originalDestinationY != -1) {
-        Serial.println("📡 Publishing re-route request to ROS2...");
+        Serial.println("📡 Publishing re-route request...");
         publishRerouteCommand(currentX, currentY, originalDestinationX, originalDestinationY);
     }
     
     Serial.println("🔄 Obstacle recovery complete - Awaiting new path");
-    currentState = STATE_IDLE; // Wait for new path
+    currentState = STATE_IDLE;
 }
