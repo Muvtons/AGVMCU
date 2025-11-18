@@ -12,7 +12,9 @@ AGVMCU::AGVMCU()
       blockedTargetX(-1), blockedTargetY(-1),
       originalDestinationX(-1), originalDestinationY(-1),
       lastAbortPress(0), lastStartPress(0), lastStopPress(0),
-      distanceBelowThresholdStart(0) {
+      distanceBelowThresholdStart(0),
+      moveStartTime(0), isMoving(false), rotateStartTime(0), 
+      isRotating(false), targetRotationTime(0), qrWaitStartTime(0) {
 }
 
 void AGVMCU::begin(long baudRate) {
@@ -38,6 +40,85 @@ void AGVMCU::begin(long baudRate) {
 
 void AGVMCU::update() {
     handleButtons();
+    updateMovementStateMachine();
+}
+
+void AGVMCU::updateMovementStateMachine() {
+    unsigned long currentTime = millis();
+    
+    // Handle non-blocking forward movement
+    if (isMoving && currentTime - moveStartTime >= 2000) {
+        stopMotors();
+        isMoving = false;
+        
+        // Update position based on direction (dead reckoning)
+        updatePositionAfterMove();
+        
+        Serial.println("⏹️ Movement completed");
+        
+        // Transition to waiting for QR confirmation
+        if (currentState == STATE_MOVING) {
+            Serial.print("📍 Movement complete. Awaiting QR verification at (");
+            Serial.print(path[currentStepIndex].x); Serial.print(","); 
+            Serial.print(path[currentStepIndex].y); Serial.println(")");
+            
+            currentState = STATE_WAITING_QR_CONFIRMATION;
+            qrWaitStartTime = currentTime;
+        }
+    }
+    
+    // Handle non-blocking rotation
+    if (isRotating && currentTime - rotateStartTime >= targetRotationTime) {
+        stopMotors();
+        isRotating = false;
+        delay(500); // Small stabilization delay after rotation
+        Serial.println("✅ Rotation completed");
+    }
+    
+    // Handle QR wait timeout
+    if (currentState == STATE_WAITING_QR_CONFIRMATION && 
+        currentTime - qrWaitStartTime >= 10000) { // 10 second timeout
+        
+        Serial.println("⚠️ QR scan timeout - Using dead reckoning position");
+        Step targetStep = path[currentStepIndex];
+        
+        // Trust our dead reckoning
+        if (isAtPosition(targetStep.x, targetStep.y)) {
+            Serial.println("✅ Position confirmed by dead reckoning");
+            currentStepIndex++;
+            
+            if (currentStepIndex >= totalSteps) {
+                Serial.println("🎉 FINAL GOAL REACHED!");
+                currentState = STATE_GOAL_REACHED;
+                publishCurrentPosition();
+            } else {
+                Serial.println("🎯 Proceeding to next step...");
+                currentState = STATE_MOVING;
+                navigateToNextStep();
+            }
+        } else {
+            Serial.println("❌ Position mismatch - Stopping for safety");
+            currentState = STATE_STOPPED;
+            stopMotors();
+        }
+    }
+}
+
+void AGVMCU::updatePositionAfterMove() {
+    Serial.print("📍 Updating position from (");
+    Serial.print(currentX); Serial.print(","); Serial.print(currentY);
+    Serial.print(") facing "); Serial.print(currentDir);
+    
+    switch(currentDir) {
+        case 'E': currentX++; break;
+        case 'W': currentX--; break;
+        case 'N': currentY++; break;
+        case 'S': currentY--; break;
+    }
+    
+    Serial.print(" to (");
+    Serial.print(currentX); Serial.print(","); Serial.print(currentY);
+    Serial.println(") [Dead Reckoning]");
 }
 
 void AGVMCU::processCommand(const char* cmd) {
@@ -72,7 +153,7 @@ void AGVMCU::processCommand(const char* cmd) {
         return;
     }
 
-    // === PATH LOADING (COMPLETELY REFORMULATED) ===
+    // === PATH LOADING ===
     if (inputBuffer.startsWith("(")) {
         Serial.println("🗺️  Loading NEW navigation path...");
         
@@ -111,7 +192,7 @@ void AGVMCU::processCommand(const char* cmd) {
         return;
     }
 
-    // === QR CODE PROCESSING (COMPLETELY REFORMULATED) ===
+    // === QR CODE PROCESSING ===
     if (inputBuffer.startsWith("QR:")) {
         String coordData = inputBuffer.substring(3);
         int firstComma = coordData.indexOf(',');
@@ -180,7 +261,7 @@ void AGVMCU::processCommand(const char* cmd) {
                 Serial.print(","); Serial.print(currentY); Serial.println(")");
                 
                 if (isAtPosition(targetStep.x, targetStep.y)) {
-                    Serial.println("✅ Step verified!");
+                    Serial.println("✅ Step verified by QR!");
                     
                     // Move to next step
                     currentStepIndex++;
@@ -247,21 +328,14 @@ void AGVMCU::navigateToNextStep() {
         rotateToDirection(currentDir, targetStep.dir);
     }
 
-    // Execute movement (blocking call)
-    Serial.println("⏩ Executing forward movement...");
+    // Execute non-blocking movement
+    Serial.println("⏩ Starting forward movement...");
     currentState = STATE_MOVING;
-    moveForward();
-    
-    // After movement, we CLAIM to be at target position
-    // But we MUST wait for QR verification to confirm
-    Serial.print("📍 Movement complete. Awaiting QR verification at (");
-    Serial.print(targetStep.x); Serial.print(","); Serial.print(targetStep.y); Serial.println(")");
-    
-    currentState = STATE_WAITING_QR_CONFIRMATION;
+    startMoveForward();
 }
 
-// Motor control functions remain the same...
-void AGVMCU::moveForward() {
+// Non-blocking motor control functions
+void AGVMCU::startMoveForward() {
     Serial.print("⏩ MOVING FORWARD from ("); 
     Serial.print(currentX); Serial.print(","); Serial.print(currentY);
     Serial.print(") facing "); Serial.print(currentDir);
@@ -274,12 +348,29 @@ void AGVMCU::moveForward() {
     analogWrite(ENA, 255);
     analogWrite(ENB, 255);
     
-    delay(2000);
-    stopMotors();
-    Serial.println("⏹️  Movement completed");
+    moveStartTime = millis();
+    isMoving = true;
+}
+
+void AGVMCU::startMoveBackward() {
+    Serial.print("⏪ MOVING BACKWARD from ("); 
+    Serial.print(currentX); Serial.print(","); Serial.print(currentY);
+    Serial.print(") facing "); Serial.print(currentDir);
+    Serial.println(" for 2 seconds (1 grid cell)");
+    
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+    analogWrite(ENA, 255);
+    analogWrite(ENB, 255);
+    
+    moveStartTime = millis();
+    isMoving = true;
 }
 
 void AGVMCU::moveBackward() {
+    // Blocking version for obstacle recovery
     Serial.print("⏪ MOVING BACKWARD from ("); 
     Serial.print(currentX); Serial.print(","); Serial.print(currentY);
     Serial.print(") facing "); Serial.print(currentDir);
@@ -294,7 +385,18 @@ void AGVMCU::moveBackward() {
     
     delay(2000);
     stopMotors();
+    
+    // Update position for backward movement
+    switch(currentDir) {
+        case 'E': currentX--; break;
+        case 'W': currentX++; break;
+        case 'N': currentY--; break;
+        case 'S': currentY++; break;
+    }
+    
     Serial.println("⏹️  Backward movement completed");
+    Serial.print("📍 New position: (");
+    Serial.print(currentX); Serial.print(","); Serial.print(currentY); Serial.println(")");
 }
 
 void AGVMCU::stopMotors() {
@@ -304,6 +406,10 @@ void AGVMCU::stopMotors() {
     digitalWrite(IN4, LOW);
     analogWrite(ENA, 0);
     analogWrite(ENB, 0);
+    
+    // Clear movement flags
+    isMoving = false;
+    isRotating = false;
 }
 
 void AGVMCU::rotateAngle(float degrees) {
@@ -335,7 +441,7 @@ void AGVMCU::rotateAngle(float degrees) {
     
     Serial.print(" for "); Serial.print(rotateTime); Serial.println("ms");
     
-    delay(rotateTime);
+    delay(rotateTime); // Keep blocking for rotation (quick operation)
     stopMotors();
     delay(500);
     
@@ -357,7 +463,7 @@ void AGVMCU::rotateToDirection(char from, char to) {
     if (angleDiff != 0) {
         Serial.print("🔄 CHANGING DIRECTION: ");
         Serial.print(from); Serial.print(" -> "); Serial.print(to);
-        Serial.print(" ("); Serial.print(angleDiff); Serial.println("°");
+        Serial.print(" ("); Serial.print(angleDiff); Serial.println("°)");
         
         rotateAngle(angleDiff);
         currentDir = to;
@@ -468,6 +574,14 @@ void AGVMCU::handleAbort() {
 void AGVMCU::handleStop() {
     Serial.println("⏸️  STOP COMMAND - PAUSING NAVIGATION");
     stopMotors();
+    
+    // If we were moving, update state appropriately
+    if (currentState == STATE_MOVING) {
+        if (isMoving) {
+            Serial.println("⚠️  Stopped during movement - position may be uncertain");
+        }
+    }
+    
     currentState = STATE_STOPPED;
     Serial.println("⏹️  System in STOPPED state");
 }
@@ -538,6 +652,7 @@ void AGVMCU::checkDistanceCondition(float currentDistance) {
             
             if (currentState == STATE_MOVING) {
                 stopMotors();
+                currentState = STATE_STOPPED;
                 Serial.println("🛑 EMERGENCY STOP - Obstacle ahead!");
             }
         } 
@@ -609,17 +724,9 @@ void AGVMCU::startObstacleRecovery() {
     
     Serial.print("🔄 Now facing: "); Serial.println(currentDir);
     
-    // Move back one cell to safe position
+    // Move back one cell to safe position (blocking OK for recovery)
     Serial.println("⏪ Moving backward to safe position...");
     moveBackward();
-    
-    // Update position (we moved back one cell from blocked position)
-    switch(currentDir) {
-        case 'E': currentX++; break;
-        case 'W': currentX--; break;
-        case 'N': currentY++; break;
-        case 'S': currentY--; break;
-    }
     
     // Request reroute from ROS2
     if (currentX != -1 && currentY != -1 && originalDestinationX != -1 && originalDestinationY != -1) {
