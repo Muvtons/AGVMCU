@@ -30,12 +30,11 @@ void AGVMCU::begin(long baudRate) {
     // Initialize all pins to safe state
     stopMotors();
     
-    Serial.println("AGV System Ready - ESP32-S3 Single Core");
+    Serial.println("✅ AGVMCU initialized - Ready for commands");
 }
 
-void AGVMCU::run() {
-    // HIGH PRIORITY: Handle all inputs first (like interrupts)
-    handleSerialInput();
+void AGVMCU::update() {
+    // HIGH PRIORITY: Handle physical buttons every cycle
     handleButtons();
     
     // MEDIUM PRIORITY: Handle state-specific continuous actions
@@ -52,6 +51,129 @@ void AGVMCU::run() {
         default:
             // Other states don't need continuous processing
             break;
+    }
+}
+
+void AGVMCU::processCommand(String command) {
+    Serial.print("[AGVMCU] Processing: ");
+    Serial.println(command);
+
+    // HIGHEST PRIORITY: Immediate command processing
+    if(command == "ABORT") {
+        handleAbort();
+        return;
+    }
+
+    if(command == "STOP") {
+        handleStop();
+        return;
+    }
+
+    if(command == "START") {
+        handleStart();
+        return;
+    }
+
+    // HIGH PRIORITY: Distance sensor data
+    if(command.startsWith("DISTANCE:")) {
+        String distanceStr = command.substring(9);
+        float currentDistance = distanceStr.toFloat();
+        
+        if(currentDistance < distanceThreshold) {
+            if(!distanceBelowThreshold) {
+                distanceBelowThreshold = true;
+                distanceBelowThresholdStart = millis();
+                
+                if(currentState == STATE_MOVING) {
+                    stopMotors();
+                    handleObstacle();
+                }
+            } else if(millis() - distanceBelowThresholdStart >= 10000) {
+                handleObstacle();
+            }
+        } else {
+            distanceBelowThreshold = false;
+        }
+        return;
+    }
+
+    // MEDIUM PRIORITY: QR code data
+    if(command.startsWith("QR:")) {
+        String coordData = command.substring(3);
+        int firstComma = coordData.indexOf(',');
+        int secondComma = coordData.indexOf(',', firstComma + 1);
+        
+        if(secondComma != -1) {
+            int qrX = coordData.substring(0, firstComma).toInt();
+            int qrY = coordData.substring(firstComma + 1, secondComma).toInt();
+            float qrAngle = coordData.substring(secondComma + 1).toFloat();
+
+            currentX = qrX;
+            currentY = qrY;
+            correctDirectionUsingQRAngle(qrAngle);
+
+            switch(currentState) {
+                case STATE_WAITING_FOR_QR:
+                    currentState = STATE_MOVING;
+                    navigateToNextStep();
+                    break;
+                    
+                case STATE_WAITING_QR_CONFIRMATION: {
+                    Step targetStep = path[currentStepIndex];
+                    if(isAtPosition(targetStep.x, targetStep.y)) {
+                        currentStepIndex++;
+                        publishCurrentPosition();
+                        
+                        if(currentStepIndex >= totalSteps) {
+                            Serial.println("DESTINATION REACHED");
+                            currentState = STATE_GOAL_REACHED;
+                        } else {
+                            currentState = STATE_MOVING;
+                            navigateToNextStep();
+                        }
+                    } else {
+                        Serial.println("NAV_FAILED: Wrong QR position");
+                        rotateAngle(180);
+                        currentState = STATE_STOPPED;
+                    }
+                    break;
+                }
+                
+                case STATE_OBSTACLE_RECOVERY:
+                    Serial.print("currentpos after blocked : ");
+                    Serial.print(currentX); Serial.print(","); Serial.println(currentY);
+                    Serial.print("blocked qr : ");
+                    Serial.print(currentX); Serial.print(","); Serial.println(currentY);
+                    currentState = STATE_IDLE;
+                    totalSteps = 0;
+                    break;
+                    
+                case STATE_ABORTED:
+                    Serial.print("currentpos after abort : ");
+                    Serial.print(currentX); Serial.print(","); Serial.println(currentY);
+                    currentState = STATE_IDLE;
+                    totalSteps = 0;
+                    break;
+            }
+        }
+        return;
+    }
+
+    // LOWEST PRIORITY: Path data (processed last)
+    if(command.startsWith("(")) {
+        parsePath(command);
+        if(totalSteps > 0) {
+            currentStepIndex = 0;
+
+            if(currentX == -1 || currentY == -1) {
+                currentState = STATE_WAITING_FOR_QR;
+                Serial.println("Waiting for initial QR...");
+            } else {
+                currentState = STATE_MOVING;
+                navigateToNextStep();
+            }
+        }
+        return;
     }
 }
 
@@ -245,141 +367,18 @@ void AGVMCU::handleButtons() {
     if(digitalRead(STOP_BUTTON_PIN) == LOW && (now - lastStopPress > 500)) {
         lastStopPress = now;
         handleStop();
+        Serial.println("[Button] STOP pressed");
     }
 
     if(digitalRead(START_BUTTON_PIN) == LOW && (now - lastStartPress > 500)) {
         lastStartPress = now;
         handleStart();
+        Serial.println("[Button] START pressed");
     }
 
     if(digitalRead(ABORT_BUTTON_PIN) == LOW && (now - lastAbortPress > 500)) {
         lastAbortPress = now;
         handleAbort();
-    }
-}
-
-void AGVMCU::handleSerialInput() {
-    // HIGH PRIORITY: Serial input processing
-    if(Serial.available()) {
-        inputBuffer = Serial.readStringUntil('\n');
-        inputBuffer.trim();
-
-        // HIGHEST PRIORITY: Immediate command processing
-        if(inputBuffer == "ABORT") {
-            handleAbort();
-            return;
-        }
-
-        if(inputBuffer == "STOP") {
-            handleStop();
-            return;
-        }
-
-        if(inputBuffer == "START") {
-            handleStart();
-            return;
-        }
-
-        // HIGH PRIORITY: Distance sensor data
-        if(inputBuffer.startsWith("DISTANCE:")) {
-            String distanceStr = inputBuffer.substring(9);
-            float currentDistance = distanceStr.toFloat();
-            
-            if(currentDistance < distanceThreshold) {
-                if(!distanceBelowThreshold) {
-                    distanceBelowThreshold = true;
-                    distanceBelowThresholdStart = millis();
-                    
-                    if(currentState == STATE_MOVING) {
-                        stopMotors();
-                        handleObstacle();
-                    }
-                } else if(millis() - distanceBelowThresholdStart >= 10000) {
-                    handleObstacle();
-                }
-            } else {
-                distanceBelowThreshold = false;
-            }
-            return;
-        }
-
-        // MEDIUM PRIORITY: QR code data
-        if(inputBuffer.startsWith("QR:")) {
-            String coordData = inputBuffer.substring(3);
-            int firstComma = coordData.indexOf(',');
-            int secondComma = coordData.indexOf(',', firstComma + 1);
-            
-            if(secondComma != -1) {
-                int qrX = coordData.substring(0, firstComma).toInt();
-                int qrY = coordData.substring(firstComma + 1, secondComma).toInt();
-                float qrAngle = coordData.substring(secondComma + 1).toFloat();
-
-                currentX = qrX;
-                currentY = qrY;
-                correctDirectionUsingQRAngle(qrAngle);
-
-                switch(currentState) {
-                    case STATE_WAITING_FOR_QR:
-                        currentState = STATE_MOVING;
-                        navigateToNextStep();
-                        break;
-                        
-                    case STATE_WAITING_QR_CONFIRMATION: {
-                        Step targetStep = path[currentStepIndex];
-                        if(isAtPosition(targetStep.x, targetStep.y)) {
-                            currentStepIndex++;
-                            publishCurrentPosition();
-                            
-                            if(currentStepIndex >= totalSteps) {
-                                Serial.println("DESTINATION REACHED");
-                                currentState = STATE_GOAL_REACHED;
-                            } else {
-                                currentState = STATE_MOVING;
-                                navigateToNextStep();
-                            }
-                        } else {
-                            Serial.println("NAV_FAILED: Wrong QR position");
-                            rotateAngle(180);
-                            currentState = STATE_STOPPED;
-                        }
-                        break;
-                    }
-                    
-                    case STATE_OBSTACLE_RECOVERY:
-                        Serial.print("currentpos after blocked : ");
-                        Serial.print(currentX); Serial.print(","); Serial.println(currentY);
-                        Serial.print("blocked qr : ");
-                        Serial.print(currentX); Serial.print(","); Serial.println(currentY);
-                        currentState = STATE_IDLE;
-                        totalSteps = 0;
-                        break;
-                        
-                    case STATE_ABORTED:
-                        Serial.print("currentpos after abort : ");
-                        Serial.print(currentX); Serial.print(","); Serial.println(currentY);
-                        currentState = STATE_IDLE;
-                        totalSteps = 0;
-                        break;
-                }
-            }
-            return;
-        }
-
-        // LOWEST PRIORITY: Path data (processed last)
-        if(inputBuffer.startsWith("(")) {
-            parsePath(inputBuffer);
-            if(totalSteps > 0) {
-                currentStepIndex = 0;
-
-                if(currentX == -1 || currentY == -1) {
-                    currentState = STATE_WAITING_FOR_QR;
-                    Serial.println("Waiting for initial QR...");
-                } else {
-                    currentState = STATE_MOVING;
-                    navigateToNextStep();
-                }
-            }
-            return;
-        }
+        Serial.println("[Button] ABORT pressed");
     }
 }
