@@ -9,8 +9,6 @@ AGVMCU::AGVMCU()
       currentDir('E'), currentState(STATE_IDLE),
       lastAbortPress(0), lastStartPress(0), lastStopPress(0),
       distanceBelowThresholdStart(0) {
-    xMutex = xSemaphoreCreateMutex();
-    xQueue = xQueueCreate(20, sizeof(Message));
 }
 
 void AGVMCU::begin(long baudRate) {
@@ -32,229 +30,32 @@ void AGVMCU::begin(long baudRate) {
     // Initialize all pins to safe state
     stopMotors();
     
-    Serial.println("AGV System Ready - ESP32-S3 Dual Core");
-    
-    // Create tasks for both cores
-    xTaskCreatePinnedToCore(core0Task, "Core0", 10000, this, 2, NULL, 0);
-    xTaskCreatePinnedToCore(core1Task, "Core1", 10000, this, 1, NULL, 1);
+    Serial.println("AGV System Ready - ESP32-S3 Single Core");
 }
 
-// Core 0 - High Priority Input Handling
-void AGVMCU::core0Task(void* parameter) {
-    AGVMCU* agv = (AGVMCU*)parameter;
-    for(;;) {
-        agv->handleCore0();
-        vTaskDelay(10 / portTICK_PERIOD_MS);
-    }
-}
-
-void AGVMCU::handleCore0() {
+void AGVMCU::run() {
+    // HIGH PRIORITY: Handle all inputs first (like interrupts)
     handleSerialInput();
     handleButtons();
-}
-
-// Core 1 - Main Logic Processing
-void AGVMCU::core1Task(void* parameter) {
-    AGVMCU* agv = (AGVMCU*)parameter;
-    for(;;) {
-        agv->handleCore1();
-        vTaskDelay(50 / portTICK_PERIOD_MS);
-    }
-}
-
-void AGVMCU::handleCore1() {
-    Message msg;
     
-    // Process all messages in queue
-    while(xQueueReceive(xQueue, &msg, 0) == pdTRUE) {
-        processMessage(msg);
-    }
-    
-    // Handle state-specific continuous processing
-    if(xSemaphoreTake(xMutex, portMAX_DELAY)) {
-        switch(currentState) {
-            case STATE_MOVING:
-                // Movement handled in navigateToNextStep
-                break;
-            case STATE_OBSTACLE_RECOVERY:
-                // In obstacle recovery - waiting for QR
-                break;
-            default:
-                break;
-        }
-        xSemaphoreGive(xMutex);
+    // MEDIUM PRIORITY: Handle state-specific continuous actions
+    switch(currentState) {
+        case STATE_MOVING:
+            // Movement is handled in navigateToNextStep() - time based
+            break;
+        case STATE_OBSTACLE_RECOVERY:
+            // Waiting for QR scan after obstacle
+            break;
+        case STATE_ABORTED:
+            // Waiting for QR scan after abort
+            break;
+        default:
+            // Other states don't need continuous processing
+            break;
     }
 }
 
-void AGVMCU::processMessage(Message msg) {
-    if(xSemaphoreTake(xMutex, portMAX_DELAY)) {
-        switch(msg.type) {
-            case MSG_PATH:
-                parsePath(msg.data);
-                if(totalSteps > 0) {
-                    currentStepIndex = 0;
-                    if(currentX == -1 || currentY == -1) {
-                        currentState = STATE_WAITING_FOR_QR;
-                        Serial.println("Waiting for initial QR...");
-                    } else {
-                        currentState = STATE_MOVING;
-                        navigateToNextStep();
-                    }
-                }
-                break;
-                
-            case MSG_QR: {
-                String coordData = msg.data;
-                int firstComma = coordData.indexOf(',');
-                int secondComma = coordData.indexOf(',', firstComma + 1);
-                
-                if(secondComma != -1) {
-                    int qrX = coordData.substring(0, firstComma).toInt();
-                    int qrY = coordData.substring(firstComma + 1, secondComma).toInt();
-                    float qrAngle = coordData.substring(secondComma + 1).toFloat();
-
-                    currentX = qrX;
-                    currentY = qrY;
-                    correctDirectionUsingQRAngle(qrAngle);
-
-                    switch(currentState) {
-                        case STATE_WAITING_FOR_QR:
-                            currentState = STATE_MOVING;
-                            navigateToNextStep();
-                            break;
-                            
-                        case STATE_WAITING_QR_CONFIRMATION: {
-                            Step targetStep = path[currentStepIndex];
-                            if(isAtPosition(targetStep.x, targetStep.y)) {
-                                currentStepIndex++;
-                                publishCurrentPosition();
-                                
-                                if(currentStepIndex >= totalSteps) {
-                                    Serial.println("DESTINATION REACHED");
-                                    currentState = STATE_GOAL_REACHED;
-                                } else {
-                                    currentState = STATE_MOVING;
-                                    navigateToNextStep();
-                                }
-                            } else {
-                                Serial.println("NAV_FAILED: Wrong QR position");
-                                rotateAngle(180);
-                                currentState = STATE_STOPPED;
-                            }
-                            break;
-                        }
-                        
-                        case STATE_OBSTACLE_RECOVERY:
-                            Serial.print("currentpos after blocked : ");
-                            Serial.print(currentX); Serial.print(","); Serial.println(currentY);
-                            Serial.print("blocked qr : ");
-                            Serial.print(currentX); Serial.print(","); Serial.println(currentY);
-                            currentState = STATE_IDLE;
-                            totalSteps = 0;
-                            break;
-                            
-                        case STATE_ABORTED:
-                            Serial.print("currentpos after abort : ");
-                            Serial.print(currentX); Serial.print(","); Serial.println(currentY);
-                            currentState = STATE_IDLE;
-                            totalSteps = 0;
-                            break;
-                    }
-                }
-                break;
-            }
-            
-            case MSG_DISTANCE: {
-                float currentDistance = msg.data.toFloat();
-                if(currentDistance < distanceThreshold) {
-                    if(!distanceBelowThreshold) {
-                        distanceBelowThreshold = true;
-                        distanceBelowThresholdStart = millis();
-                        
-                        if(currentState == STATE_MOVING) {
-                            stopMotors();
-                            handleObstacle();
-                        }
-                    }
-                } else {
-                    distanceBelowThreshold = false;
-                }
-                break;
-            }
-            
-            case MSG_COMMAND:
-                if(msg.data == "STOP") handleStop();
-                else if(msg.data == "START") handleStart();
-                else if(msg.data == "ABORT") handleAbort();
-                break;
-                
-            case MSG_BUTTON:
-                if(msg.data == "STOP") handleStop();
-                else if(msg.data == "START") handleStart();
-                else if(msg.data == "ABORT") handleAbort();
-                break;
-        }
-        xSemaphoreGive(xMutex);
-    }
-}
-
-void AGVMCU::handleSerialInput() {
-    if(Serial.available()) {
-        String input = Serial.readStringUntil('\n');
-        input.trim();
-        
-        Message msg;
-        
-        if(input == "ABORT" || input == "STOP" || input == "START") {
-            msg.type = MSG_COMMAND;
-            msg.data = input;
-            xQueueSend(xQueue, &msg, portMAX_DELAY);
-        }
-        else if(input.startsWith("DISTANCE:")) {
-            msg.type = MSG_DISTANCE;
-            msg.data = input.substring(9);
-            xQueueSend(xQueue, &msg, portMAX_DELAY);
-        }
-        else if(input.startsWith("QR:")) {
-            msg.type = MSG_QR;
-            msg.data = input.substring(3);
-            xQueueSend(xQueue, &msg, portMAX_DELAY);
-        }
-        else if(input.startsWith("(")) {
-            msg.type = MSG_PATH;
-            msg.data = input;
-            xQueueSend(xQueue, &msg, portMAX_DELAY);
-        }
-    }
-}
-
-void AGVMCU::handleButtons() {
-    unsigned long now = millis();
-    Message msg;
-
-    if(digitalRead(STOP_BUTTON_PIN) == LOW && (now - lastStopPress > 500)) {
-        lastStopPress = now;
-        msg.type = MSG_BUTTON;
-        msg.data = "STOP";
-        xQueueSend(xQueue, &msg, portMAX_DELAY);
-    }
-
-    if(digitalRead(START_BUTTON_PIN) == LOW && (now - lastStartPress > 500)) {
-        lastStartPress = now;
-        msg.type = MSG_BUTTON;
-        msg.data = "START";
-        xQueueSend(xQueue, &msg, portMAX_DELAY);
-    }
-
-    if(digitalRead(ABORT_BUTTON_PIN) == LOW && (now - lastAbortPress > 500)) {
-        lastAbortPress = now;
-        msg.type = MSG_BUTTON;
-        msg.data = "ABORT";
-        xQueueSend(xQueue, &msg, portMAX_DELAY);
-    }
-}
-
-// Motor Control Functions
+// Motor Control Functions (same as before)
 void AGVMCU::moveForward() {
     digitalWrite(IN1, HIGH);
     digitalWrite(IN2, LOW);
@@ -349,6 +150,7 @@ void AGVMCU::navigateToNextStep() {
 
     Step targetStep = path[currentStepIndex];
 
+    // Check if direction needs to be changed
     if(currentDir != targetStep.dir) {
         rotateToDirection(currentDir, targetStep.dir);
     }
@@ -398,14 +200,6 @@ void AGVMCU::publishCurrentPosition() {
     Serial.print(","); Serial.println(currentDir);
 }
 
-void AGVMCU::publishRerouteCommand(int src_x, int src_y, int dst_x, int dst_y) {
-    Serial.print("REROUTE:SRC:(");
-    Serial.print(src_x); Serial.print(","); Serial.print(src_y);
-    Serial.print("):DST:(");
-    Serial.print(dst_x); Serial.print(","); Serial.print(dst_y);
-    Serial.println("):ONCE");
-}
-
 void AGVMCU::handleAbort() {
     stopMotors();
     currentState = STATE_ABORTED;
@@ -442,4 +236,150 @@ void AGVMCU::handleObstacle() {
     stopMotors();
     
     Serial.println("OBSTACLE: Waiting for QR scan...");
+}
+
+void AGVMCU::handleButtons() {
+    unsigned long now = millis();
+
+    // HIGH PRIORITY: Button checks with debouncing
+    if(digitalRead(STOP_BUTTON_PIN) == LOW && (now - lastStopPress > 500)) {
+        lastStopPress = now;
+        handleStop();
+    }
+
+    if(digitalRead(START_BUTTON_PIN) == LOW && (now - lastStartPress > 500)) {
+        lastStartPress = now;
+        handleStart();
+    }
+
+    if(digitalRead(ABORT_BUTTON_PIN) == LOW && (now - lastAbortPress > 500)) {
+        lastAbortPress = now;
+        handleAbort();
+    }
+}
+
+void AGVMCU::handleSerialInput() {
+    // HIGH PRIORITY: Serial input processing
+    if(Serial.available()) {
+        inputBuffer = Serial.readStringUntil('\n');
+        inputBuffer.trim();
+
+        // HIGHEST PRIORITY: Immediate command processing
+        if(inputBuffer == "ABORT") {
+            handleAbort();
+            return;
+        }
+
+        if(inputBuffer == "STOP") {
+            handleStop();
+            return;
+        }
+
+        if(inputBuffer == "START") {
+            handleStart();
+            return;
+        }
+
+        // HIGH PRIORITY: Distance sensor data
+        if(inputBuffer.startsWith("DISTANCE:")) {
+            String distanceStr = inputBuffer.substring(9);
+            float currentDistance = distanceStr.toFloat();
+            
+            if(currentDistance < distanceThreshold) {
+                if(!distanceBelowThreshold) {
+                    distanceBelowThreshold = true;
+                    distanceBelowThresholdStart = millis();
+                    
+                    if(currentState == STATE_MOVING) {
+                        stopMotors();
+                        handleObstacle();
+                    }
+                } else if(millis() - distanceBelowThresholdStart >= 10000) {
+                    handleObstacle();
+                }
+            } else {
+                distanceBelowThreshold = false;
+            }
+            return;
+        }
+
+        // MEDIUM PRIORITY: QR code data
+        if(inputBuffer.startsWith("QR:")) {
+            String coordData = inputBuffer.substring(3);
+            int firstComma = coordData.indexOf(',');
+            int secondComma = coordData.indexOf(',', firstComma + 1);
+            
+            if(secondComma != -1) {
+                int qrX = coordData.substring(0, firstComma).toInt();
+                int qrY = coordData.substring(firstComma + 1, secondComma).toInt();
+                float qrAngle = coordData.substring(secondComma + 1).toFloat();
+
+                currentX = qrX;
+                currentY = qrY;
+                correctDirectionUsingQRAngle(qrAngle);
+
+                switch(currentState) {
+                    case STATE_WAITING_FOR_QR:
+                        currentState = STATE_MOVING;
+                        navigateToNextStep();
+                        break;
+                        
+                    case STATE_WAITING_QR_CONFIRMATION: {
+                        Step targetStep = path[currentStepIndex];
+                        if(isAtPosition(targetStep.x, targetStep.y)) {
+                            currentStepIndex++;
+                            publishCurrentPosition();
+                            
+                            if(currentStepIndex >= totalSteps) {
+                                Serial.println("DESTINATION REACHED");
+                                currentState = STATE_GOAL_REACHED;
+                            } else {
+                                currentState = STATE_MOVING;
+                                navigateToNextStep();
+                            }
+                        } else {
+                            Serial.println("NAV_FAILED: Wrong QR position");
+                            rotateAngle(180);
+                            currentState = STATE_STOPPED;
+                        }
+                        break;
+                    }
+                    
+                    case STATE_OBSTACLE_RECOVERY:
+                        Serial.print("currentpos after blocked : ");
+                        Serial.print(currentX); Serial.print(","); Serial.println(currentY);
+                        Serial.print("blocked qr : ");
+                        Serial.print(currentX); Serial.print(","); Serial.println(currentY);
+                        currentState = STATE_IDLE;
+                        totalSteps = 0;
+                        break;
+                        
+                    case STATE_ABORTED:
+                        Serial.print("currentpos after abort : ");
+                        Serial.print(currentX); Serial.print(","); Serial.println(currentY);
+                        currentState = STATE_IDLE;
+                        totalSteps = 0;
+                        break;
+                }
+            }
+            return;
+        }
+
+        // LOWEST PRIORITY: Path data (processed last)
+        if(inputBuffer.startsWith("(")) {
+            parsePath(inputBuffer);
+            if(totalSteps > 0) {
+                currentStepIndex = 0;
+
+                if(currentX == -1 || currentY == -1) {
+                    currentState = STATE_WAITING_FOR_QR;
+                    Serial.println("Waiting for initial QR...");
+                } else {
+                    currentState = STATE_MOVING;
+                    navigateToNextStep();
+                }
+            }
+            return;
+        }
+    }
 }
